@@ -87,10 +87,10 @@ func OpenArchive(store storage.ObjectReader, p *pipeline.Pipeline, opts ...OpenO
 
 // GetFile retrieves and unpacks a single file from the archive.
 // It returns the raw file data and the associated FileEntry metadata.
-// Returns os.ErrNotExist if the file is not in the index.
+// Returns os.ErrNotExist if the file is not in the index or has been deleted.
 func (ar *ArchiveReader) GetFile(filepath string) ([]byte, *FileEntry, error) {
 	entry, exists := ar.index.Get(filepath)
-	if !exists {
+	if !exists || entry.IsDeleted {
 		return nil, nil, os.ErrNotExist
 	}
 
@@ -108,18 +108,27 @@ func (ar *ArchiveReader) GetFile(filepath string) ([]byte, *FileEntry, error) {
 }
 
 // GetEntry returns the metadata for a file without fetching its data.
-// Returns (nil, false) if the path is not in the index.
+// Returns (nil, false) if the path is not in the index or has been deleted.
 func (ar *ArchiveReader) GetEntry(filepath string) (*FileEntry, bool) {
 	entry, exists := ar.index.Get(filepath)
-	if !exists {
+	if !exists || entry.IsDeleted {
 		return nil, false
 	}
 	return &entry, true
 }
 
-// ListFiles returns a sorted list of all file paths in the archive.
+// ListFiles returns a sorted list of all file paths in the archive,
+// excluding deleted entries.
 func (ar *ArchiveReader) ListFiles() []string {
-	return ar.index.List()
+	all := ar.index.List()
+	live := make([]string, 0, len(all))
+	for _, p := range all {
+		entry, ok := ar.index.Get(p)
+		if ok && !entry.IsDeleted {
+			live = append(live, p)
+		}
+	}
+	return live
 }
 
 // Index returns a flat map copy of the full index. Modifying the returned

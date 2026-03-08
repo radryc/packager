@@ -359,3 +359,102 @@ func TestIndexCopy(t *testing.T) {
 		t.Error("GetEntry should still find a.txt after external index mutation")
 	}
 }
+
+func TestDeleteFile(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	opts := DefaultAddFileOptions()
+	if err := w.AddFile("keep.txt", []byte("keeper"), opts); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddFile("remove.txt", []byte("gone"), opts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark remove.txt as deleted
+	w.Delete("remove.txt")
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// Deleted file should not be retrievable
+	_, _, err = ar.GetFile("remove.txt")
+	if err == nil {
+		t.Fatal("expected error for deleted file")
+	}
+
+	// Deleted file should not appear in GetEntry
+	_, ok := ar.GetEntry("remove.txt")
+	if ok {
+		t.Error("GetEntry should return false for deleted file")
+	}
+
+	// Deleted file should not appear in ListFiles
+	listed := ar.ListFiles()
+	for _, f := range listed {
+		if f == "remove.txt" {
+			t.Error("deleted file should not appear in ListFiles")
+		}
+	}
+	if len(listed) != 1 || listed[0] != "keep.txt" {
+		t.Errorf("expected [keep.txt], got %v", listed)
+	}
+
+	// Non-deleted file still works
+	data, _, err := ar.GetFile("keep.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keeper" {
+		t.Errorf("got %q, want %q", data, "keeper")
+	}
+}
+
+func TestDeleteOnlyFile(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Delete a file that was never added (pure tombstone)
+	w.Delete("phantom.txt")
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	if files := ar.ListFiles(); len(files) != 0 {
+		t.Errorf("expected 0 listed files, got %v", files)
+	}
+
+	_, _, err = ar.GetFile("phantom.txt")
+	if err == nil {
+		t.Fatal("expected error for deleted phantom file")
+	}
+}

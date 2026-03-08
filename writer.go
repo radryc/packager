@@ -94,6 +94,17 @@ func (aw *ArchiveWriter) AddFile(filepath string, rawData []byte, opts AddFileOp
 	return nil
 }
 
+// Delete records a tombstone entry for the given filepath. No data is written
+// to the archive — the index simply gains a zero-size entry with IsDeleted
+// set to true. Readers treat deleted entries as non-existent.
+func (aw *ArchiveWriter) Delete(filepath string) {
+	aw.index.Put(filepath, FileEntry{
+		Offset:    aw.currentOffset,
+		Size:      0,
+		IsDeleted: true,
+	})
+}
+
 // Close finalises the archive by writing the encrypted master index and
 // the 8-byte little-endian footer. The master index is always compressed
 // and encrypted regardless of per-file settings.

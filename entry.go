@@ -14,4 +14,6 @@ type FileEntry struct {
 	IsEncrypted bool `json:"e"`
 	// IsCompressed indicates whether zstd compression was applied to this block.
 	IsCompressed bool `json:"c"`
+	// IsDeleted marks the entry as a tombstone (logically deleted file).
+	IsDeleted bool `json:"del,omitempty"`
 }
