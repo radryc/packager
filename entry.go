@@ -1,8 +1,6 @@
 package packager
 
 // FileEntry stores the location and metadata for a single file inside the archive.
-// JSON keys are kept short to minimise index size (the entire index is also
-// zstd-compressed, which handles path-prefix deduplication very well).
 type FileEntry struct {
 	// Offset is the byte offset of the packed data block in the archive.
 	Offset int64 `json:"o"`
@@ -17,8 +15,3 @@ type FileEntry struct {
 	// IsCompressed indicates whether zstd compression was applied to this block.
 	IsCompressed bool `json:"c"`
 }
-
-// MasterIndex maps full file paths to their corresponding FileEntry.
-// Path compression is handled implicitly by zstd when the serialised JSON
-// index is compressed as a whole.
-type MasterIndex map[string]FileEntry

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"sort"
 
 	"github.com/radryc/packager/pipeline"
 	"github.com/radryc/packager/storage"
@@ -17,7 +16,7 @@ import (
 type ArchiveReader struct {
 	store    storage.ObjectReader
 	pipeline *pipeline.Pipeline
-	index    MasterIndex
+	index    *PathIndex
 }
 
 // openConfig holds optional parameters for OpenArchive.
@@ -78,8 +77,8 @@ func OpenArchive(store storage.ObjectReader, p *pipeline.Pipeline, opts ...OpenO
 		return nil, err
 	}
 
-	var index MasterIndex
-	if err := json.Unmarshal(rawIndex, &index); err != nil {
+	index := NewPathIndex()
+	if err := json.Unmarshal(rawIndex, index); err != nil {
 		return nil, err
 	}
 
@@ -90,7 +89,7 @@ func OpenArchive(store storage.ObjectReader, p *pipeline.Pipeline, opts ...OpenO
 // It returns the raw file data and the associated FileEntry metadata.
 // Returns os.ErrNotExist if the file is not in the index.
 func (ar *ArchiveReader) GetFile(filepath string) ([]byte, *FileEntry, error) {
-	entry, exists := ar.index[filepath]
+	entry, exists := ar.index.Get(filepath)
 	if !exists {
 		return nil, nil, os.ErrNotExist
 	}
@@ -111,7 +110,7 @@ func (ar *ArchiveReader) GetFile(filepath string) ([]byte, *FileEntry, error) {
 // GetEntry returns the metadata for a file without fetching its data.
 // Returns (nil, false) if the path is not in the index.
 func (ar *ArchiveReader) GetEntry(filepath string) (*FileEntry, bool) {
-	entry, exists := ar.index[filepath]
+	entry, exists := ar.index.Get(filepath)
 	if !exists {
 		return nil, false
 	}
@@ -120,22 +119,13 @@ func (ar *ArchiveReader) GetEntry(filepath string) (*FileEntry, bool) {
 
 // ListFiles returns a sorted list of all file paths in the archive.
 func (ar *ArchiveReader) ListFiles() []string {
-	paths := make([]string, 0, len(ar.index))
-	for p := range ar.index {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
-	return paths
+	return ar.index.List()
 }
 
-// Index returns a copy of the full master index. Modifying the returned
+// Index returns a flat map copy of the full index. Modifying the returned
 // map does not affect the archive.
-func (ar *ArchiveReader) Index() MasterIndex {
-	cp := make(MasterIndex, len(ar.index))
-	for k, v := range ar.index {
-		cp[k] = v
-	}
-	return cp
+func (ar *ArchiveReader) Index() map[string]FileEntry {
+	return ar.index.ToMap()
 }
 
 // Close releases the underlying storage handle.

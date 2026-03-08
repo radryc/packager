@@ -40,7 +40,7 @@ func DefaultAddFileOptions() AddFileOptions {
 type ArchiveWriter struct {
 	writer        io.Writer
 	pipeline      *pipeline.Pipeline
-	index         MasterIndex
+	index         *PathIndex
 	currentOffset int64
 }
 
@@ -49,7 +49,7 @@ func NewArchiveWriter(w io.Writer, p *pipeline.Pipeline) *ArchiveWriter {
 	return &ArchiveWriter{
 		writer:        w,
 		pipeline:      p,
-		index:         make(MasterIndex),
+		index:         NewPathIndex(),
 		currentOffset: 0,
 	}
 }
@@ -81,14 +81,14 @@ func (aw *ArchiveWriter) AddFile(filepath string, rawData []byte, opts AddFileOp
 		return fmt.Errorf("write %q: %w", filepath, err)
 	}
 
-	aw.index[filepath] = FileEntry{
+	aw.index.Put(filepath, FileEntry{
 		Offset:       aw.currentOffset,
 		Size:         int64(n),
 		Permission:   opts.Permission,
 		OwnerUID:     opts.OwnerUID,
 		IsEncrypted:  opts.Encrypt,
 		IsCompressed: compress,
-	}
+	})
 
 	aw.currentOffset += int64(n)
 	return nil
