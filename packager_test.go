@@ -458,3 +458,139 @@ func TestDeleteOnlyFile(t *testing.T) {
 		t.Fatal("expected error for deleted phantom file")
 	}
 }
+
+func TestDirectoryEntry(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Add a directory entry
+	dirOpts := AddFileOptions{Permission: 0755, OwnerUID: 0, Encrypt: true, FileType: FileTypeDir}
+	if err := w.AddFile("src/", nil, dirOpts); err != nil {
+		t.Fatalf("AddFile dir: %v", err)
+	}
+
+	// Add a regular file inside that directory
+	fileOpts := DefaultAddFileOptions()
+	if err := w.AddFile("src/main.go", []byte("package main\n"), fileOpts); err != nil {
+		t.Fatalf("AddFile regular: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// Directory should return nil data
+	data, entry, err := ar.GetFile("src/")
+	if err != nil {
+		t.Fatalf("GetFile(dir): %v", err)
+	}
+	if data != nil {
+		t.Errorf("directory data should be nil, got %d bytes", len(data))
+	}
+	if entry.FileType != FileTypeDir {
+		t.Errorf("FileType = %d, want %d (FileTypeDir)", entry.FileType, FileTypeDir)
+	}
+	if entry.Permission != 0755 {
+		t.Errorf("Permission = %o, want 0755", entry.Permission)
+	}
+
+	// Regular file still works
+	data, entry, err = ar.GetFile("src/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "package main\n" {
+		t.Errorf("got %q, want %q", data, "package main\n")
+	}
+	if entry.FileType != FileTypeRegular {
+		t.Errorf("FileType = %d, want %d (FileTypeRegular)", entry.FileType, FileTypeRegular)
+	}
+
+	// Both entries should appear in ListFiles
+	listed := ar.ListFiles()
+	if len(listed) != 2 {
+		t.Fatalf("ListFiles: got %d entries, want 2", len(listed))
+	}
+}
+
+func TestSymlinkEntry(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Add a symlink entry (LinkTarget used as content)
+	linkOpts := AddFileOptions{
+		Permission: 0777,
+		OwnerUID:   1000,
+		Encrypt:    true,
+		FileType:   FileTypeSymlink,
+		LinkTarget: "../real/target.txt",
+	}
+	if err := w.AddFile("link.txt", nil, linkOpts); err != nil {
+		t.Fatalf("AddFile symlink: %v", err)
+	}
+
+	// Add a symlink with explicit rawData (should use rawData, not LinkTarget)
+	linkOpts2 := AddFileOptions{
+		Permission: 0777,
+		Encrypt:    true,
+		FileType:   FileTypeSymlink,
+		LinkTarget: "ignored-target",
+	}
+	if err := w.AddFile("link2.txt", []byte("explicit-target"), linkOpts2); err != nil {
+		t.Fatalf("AddFile symlink with data: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// First symlink: link target stored as data
+	data, entry, err := ar.GetFile("link.txt")
+	if err != nil {
+		t.Fatalf("GetFile(symlink): %v", err)
+	}
+	if string(data) != "../real/target.txt" {
+		t.Errorf("symlink data = %q, want %q", data, "../real/target.txt")
+	}
+	if entry.FileType != FileTypeSymlink {
+		t.Errorf("FileType = %d, want %d (FileTypeSymlink)", entry.FileType, FileTypeSymlink)
+	}
+
+	// Second symlink: explicit rawData takes precedence
+	data, entry, err = ar.GetFile("link2.txt")
+	if err != nil {
+		t.Fatalf("GetFile(symlink2): %v", err)
+	}
+	if string(data) != "explicit-target" {
+		t.Errorf("symlink2 data = %q, want %q", data, "explicit-target")
+	}
+	if entry.FileType != FileTypeSymlink {
+		t.Errorf("FileType = %d, want %d (FileTypeSymlink)", entry.FileType, FileTypeSymlink)
+	}
+}

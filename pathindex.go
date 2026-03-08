@@ -161,15 +161,16 @@ type serializedIndex struct {
 }
 
 type serializedFile struct {
-	DirID        uint32 `json:"d"`
-	Name         string `json:"n"`
-	Offset       int64  `json:"o"`
-	Size         int64  `json:"s"`
-	Permission   uint32 `json:"p"`
-	OwnerUID     int    `json:"u"`
-	IsEncrypted  bool   `json:"e,omitempty"`
-	IsCompressed bool   `json:"c,omitempty"`
-	IsDeleted    bool   `json:"del,omitempty"`
+	DirID        uint32   `json:"d"`
+	Name         string   `json:"n"`
+	Offset       int64    `json:"o"`
+	Size         int64    `json:"s"`
+	Permission   uint32   `json:"p"`
+	OwnerUID     int      `json:"u"`
+	IsEncrypted  bool     `json:"e,omitempty"`
+	IsCompressed bool     `json:"c,omitempty"`
+	IsDeleted    bool     `json:"del,omitempty"`
+	FileType     FileType `json:"t,omitempty"`
 }
 
 // MarshalJSON serialises the PathIndex using the prefix-table format.
@@ -193,6 +194,7 @@ func (pi *PathIndex) MarshalJSON() ([]byte, error) {
 				IsEncrypted:  f.entry.IsEncrypted,
 				IsCompressed: f.entry.IsCompressed,
 				IsDeleted:    f.entry.IsDeleted,
+				FileType:     f.entry.FileType,
 			})
 		}
 	}
@@ -229,6 +231,7 @@ func (pi *PathIndex) UnmarshalJSON(data []byte) error {
 				IsEncrypted:  f.IsEncrypted,
 				IsCompressed: f.IsCompressed,
 				IsDeleted:    f.IsDeleted,
+				FileType:     f.FileType,
 			},
 		})
 		pi.count++

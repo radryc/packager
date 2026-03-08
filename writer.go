@@ -22,6 +22,12 @@ type AddFileOptions struct {
 	// nil  → auto-detect (skip compression for already-compressed formats).
 	// true → always compress.  false → never compress.
 	ForceCompress *bool
+	// FileType indicates whether this is a regular file (0), directory (1),
+	// or symlink (2). Defaults to FileTypeRegular.
+	FileType FileType
+	// LinkTarget is the symlink destination path. Only used when
+	// FileType == FileTypeSymlink.
+	LinkTarget string
 }
 
 // DefaultAddFileOptions returns sensible defaults: 0644 perms, UID 0,
@@ -60,6 +66,16 @@ func NewArchiveWriter(w io.Writer, p *pipeline.Pipeline) *ArchiveWriter {
 // compressed format (detected by extension and magic bytes) unless overridden
 // via opts.ForceCompress.
 func (aw *ArchiveWriter) AddFile(filepath string, rawData []byte, opts AddFileOptions) error {
+	// For directories, store zero bytes (the directory itself has no content).
+	if opts.FileType == FileTypeDir {
+		rawData = nil
+	}
+
+	// For symlinks, store the link target as content if rawData is nil/empty.
+	if opts.FileType == FileTypeSymlink && len(rawData) == 0 && opts.LinkTarget != "" {
+		rawData = []byte(opts.LinkTarget)
+	}
+
 	// Determine whether to compress
 	compress := true
 	if opts.ForceCompress != nil {
@@ -88,6 +104,7 @@ func (aw *ArchiveWriter) AddFile(filepath string, rawData []byte, opts AddFileOp
 		OwnerUID:     opts.OwnerUID,
 		IsEncrypted:  opts.Encrypt,
 		IsCompressed: compress,
+		FileType:     opts.FileType,
 	})
 
 	aw.currentOffset += int64(n)

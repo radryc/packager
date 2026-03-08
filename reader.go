@@ -87,11 +87,18 @@ func OpenArchive(store storage.ObjectReader, p *pipeline.Pipeline, opts ...OpenO
 
 // GetFile retrieves and unpacks a single file from the archive.
 // It returns the raw file data and the associated FileEntry metadata.
+// For directories the returned data is nil. For symlinks the returned data
+// is the link target path.
 // Returns os.ErrNotExist if the file is not in the index or has been deleted.
 func (ar *ArchiveReader) GetFile(filepath string) ([]byte, *FileEntry, error) {
 	entry, exists := ar.index.Get(filepath)
 	if !exists || entry.IsDeleted {
 		return nil, nil, os.ErrNotExist
+	}
+
+	// Directories carry no content data.
+	if entry.FileType == FileTypeDir {
+		return nil, &entry, nil
 	}
 
 	encryptedData := make([]byte, entry.Size)
