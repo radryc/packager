@@ -9,6 +9,7 @@ A high-performance Go library that packs multiple files into a single encrypted,
 - **Ultra-fast compression** — zstd via [klauspost/compress](https://github.com/klauspost/compress). Multi-GB/s decompression, automatic skip for already-compressed formats.
 - **Smart detection** — PNG, JPEG, GIF, ZIP, MP4, and 20+ other formats are auto-detected by extension and magic bytes; compression is skipped automatically.
 - **Rich metadata** — each file entry stores Unix permissions, owner UID, encryption flag, and compression flag.
+- **Memory-efficient index** — `PathIndex` deduplicates directory prefixes, storing each unique directory once. 100K files in 500 dirs uses ~1.2 MB instead of ~6.2 MB of path strings.
 - **WORM model** — write-once, read-many. Archives are immutable; updates create new archives.
 - **Pluggable storage** — `ObjectReader` interface with built-in implementations for local files, AWS S3, and Google Cloud Storage.
 - **Bit-rot protection** — AEAD authentication detects any corruption or tampering on read.
@@ -191,7 +192,7 @@ Each file in the archive carries:
 | IsEncrypted | `e` | bool | Whether AEAD encryption was applied |
 | IsCompressed | `c` | bool | Whether zstd compression was applied |
 
-JSON keys are kept short to minimise index size. The entire index is also zstd-compressed, which handles path-prefix deduplication very effectively.
+JSON keys are kept short to minimise index size. The entire index is also zstd-compressed.
 
 ## Pre-Compressed Format Detection
 
@@ -203,12 +204,40 @@ Files in already-compressed formats automatically skip zstd compression. Detecti
 
 Override auto-detection with `AddFileOptions.ForceCompress`.
 
+## Memory-Efficient Path Index
+
+The in-memory index uses `PathIndex` with **directory-prefix deduplication** rather than a flat `map[string]FileEntry`. Each unique directory path is stored once in a shared table; file entries retain only their basename plus a directory ID.
+
+```
+Memory: O(D × avg_dir_len + N × avg_basename_len)  vs  O(N × avg_path_len)
+```
+
+**Example:** 100,000 files across 500 directories with 50-byte average directory prefixes:
+- Flat map: ~6.2 MB of path strings
+- PathIndex: ~25 KB dirs + ~1.2 MB basenames = **~1.2 MB** (5× reduction)
+
+The on-disk serialization also uses a prefix-table format:
+
+```json
+{
+  "d": ["src/pkg/handlers", "src/pkg/models", ...],
+  "f": [
+    {"d": 0, "n": "auth.go", "o": 0, "s": 512, "p": 420, "u": 1000, "e": true, "c": true},
+    {"d": 0, "n": "user.go", "o": 512, "s": 256, "p": 420, "u": 1000, "e": true, "c": true},
+    ...
+  ]
+}
+```
+
+This produces smaller JSON before zstd compression kicks in, as directory strings are not repeated per file.
+
 ## Package Structure
 
 ```
 packager/
 ├── doc.go              # Package documentation
-├── entry.go            # FileEntry, MasterIndex types
+├── entry.go            # FileEntry type
+├── pathindex.go        # PathIndex (dir-prefix-deduplicated file index)
 ├── detect.go           # Pre-compressed format detection
 ├── writer.go           # ArchiveWriter (sequential WORM builder)
 ├── reader.go           # ArchiveReader (O(1) random-access)
@@ -229,6 +258,7 @@ packager/
 - **Indexed-Tail** over Central-Directory (zip) or Header-based (tar): enables 2-request retrieval without scanning; index is encrypted hiding directory structure.
 - **Per-file nonces**: each file gets a unique random 12-byte nonce, preventing key-reuse vulnerabilities even with a single master key.
 - **Master index always encrypted+compressed**: even if individual files opt out of encryption, the directory structure is always protected.
+- **Directory-prefix deduplication** over per-key compression: file paths share common prefixes (directory trees), so deduplicating directories gives 3–5× memory savings without CPU cost on lookups. Per-key zstd/gzip on short strings (avg 30–60 bytes) yields poor ratios and adds decode overhead per access.
 
 ## License
 
