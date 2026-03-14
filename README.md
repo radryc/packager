@@ -141,17 +141,6 @@ func main() {
 ### Using with S3
 
 ```go
-import (
-    "context"
-
-    "github.com/aws/aws-sdk-go-v2/config"
-    "github.com/aws/aws-sdk-go-v2/service/s3"
-    "github.com/radryc/packager/storage"
-)
-
-cfg, _ := config.LoadDefaultConfig(context.TODO(), config.WithRegion("us-east-1"))
-client := s3.NewFromConfig(cfg)
-
 store := storage.NewS3Reader(client, "my-bucket", "archives/repo.pack",
     storage.WithS3Context(ctx),
 )
@@ -164,20 +153,203 @@ ar, err := packager.OpenArchive(store, p,
 ### Using with GCS
 
 ```go
-import (
-    gcStorage "cloud.google.com/go/storage"
-    "github.com/radryc/packager/storage"
-)
-
-gcsClient, _ := gcStorage.NewClient(ctx)
-bucket := gcsClient.Bucket("my-bucket")
-
 store := storage.NewGCSReader(bucket, "archives/repo.pack",
     storage.WithGCSContext(ctx),
 )
 
 ar, err := packager.OpenArchive(store, p)
 ```
+
+## Cloud Storage Setup
+
+Both AWS S3 and GCS backends work **inside and outside** of cloud environments.
+When running inside the cloud (EC2, ECS, EKS, GCE, Cloud Run, GKE, …) credentials are picked up automatically from the instance metadata / workload identity.
+When running externally (local machine, CI, on-prem) you supply credentials explicitly via config flags, environment variables, or credential files.
+
+### AWS S3
+
+#### Configuration
+
+`storage.S3Config` drives client creation:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `Region` | `string` | **yes** | AWS region, e.g. `"us-east-1"` |
+| `Endpoint` | `string` | no | Custom endpoint URL (MinIO, Ceph, LocalStack, …) |
+| `AccessKeyID` | `string` | no | Static IAM access key |
+| `SecretAccessKey` | `string` | no | Static IAM secret key |
+| `SessionToken` | `string` | no | STS session token for temporary credentials |
+| `UsePathStyle` | `bool` | no | Path-style addressing (`http://s3/bucket/key` instead of `http://bucket.s3/key`). Required for most S3-compatible services. |
+
+#### Credential resolution order
+
+1. **Static credentials** — if `AccessKeyID` + `SecretAccessKey` are set, they are used directly.
+2. **Default AWS credential chain** (automatic) — environment variables → `~/.aws/credentials` shared file → IAM role (EC2 instance profile / ECS task role / EKS IRSA).
+
+#### Running inside AWS (EC2, ECS, EKS, Lambda)
+
+No explicit credentials needed — the SDK picks up the attached IAM role automatically:
+
+```go
+store, err := storage.NewS3ReaderFromConfig(ctx, storage.S3Config{
+    Region: "us-east-1",
+}, "my-bucket", "archives/repo.pack")
+```
+
+#### Running outside AWS (local dev, CI, on-prem)
+
+**Option A — environment variables** (recommended for CI):
+
+```bash
+export AWS_ACCESS_KEY_ID=AKIA…
+export AWS_SECRET_ACCESS_KEY=wJalr…
+export AWS_REGION=us-east-1
+```
+
+```go
+store, err := storage.NewS3ReaderFromConfig(ctx, storage.S3Config{
+    Region: "us-east-1",
+}, "my-bucket", "archives/repo.pack")
+```
+
+**Option B — explicit credentials in config** (useful for programmatic setup):
+
+```go
+store, err := storage.NewS3ReaderFromConfig(ctx, storage.S3Config{
+    Region:         "us-east-1",
+    AccessKeyID:    os.Getenv("AWS_ACCESS_KEY_ID"),
+    SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+}, "my-bucket", "archives/repo.pack")
+```
+
+**Option C — AWS CLI shared credentials** (`~/.aws/credentials`):
+
+```bash
+aws configure   # sets up ~/.aws/credentials
+```
+
+```go
+// SDK reads ~/.aws/credentials automatically
+store, err := storage.NewS3ReaderFromConfig(ctx, storage.S3Config{
+    Region: "us-east-1",
+}, "my-bucket", "archives/repo.pack")
+```
+
+#### Using with S3-compatible services (MinIO, Ceph, LocalStack)
+
+```go
+store, err := storage.NewS3ReaderFromConfig(ctx, storage.S3Config{
+    Region:         "us-east-1",
+    Endpoint:       "http://localhost:9000",
+    AccessKeyID:    "minioadmin",
+    SecretAccessKey: "minioadmin",
+    UsePathStyle:   true,
+}, "my-bucket", "archives/repo.pack")
+```
+
+#### Advanced: bring your own client
+
+If you need full control over the `*s3.Client` (custom HTTP transport, retry policy, etc.) you can create it yourself and pass it directly:
+
+```go
+client, err := storage.NewS3Client(ctx, storage.S3Config{
+    Region: "us-east-1",
+})
+// … or build *s3.Client however you like …
+
+store := storage.NewS3Reader(client, "my-bucket", "archives/repo.pack",
+    storage.WithS3Context(ctx),
+)
+```
+
+---
+
+### Google Cloud Storage (GCS)
+
+#### Configuration
+
+`storage.GCSConfig` drives client creation:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `CredentialsFile` | `string` | no | Path to a service account JSON key file |
+| `CredentialsJSON` | `[]byte` | no | Inline service account JSON key content (takes precedence over `CredentialsFile`) |
+
+#### Credential resolution order
+
+1. **`CredentialsJSON`** — raw JSON key bytes provided in config.
+2. **`CredentialsFile`** — path to a JSON key file on disk.
+3. **Application Default Credentials (ADC)** (automatic) — `GOOGLE_APPLICATION_CREDENTIALS` env var → `gcloud auth application-default login` → GCE metadata server / GKE Workload Identity.
+
+#### Running inside GCP (GCE, Cloud Run, GKE)
+
+No explicit credentials needed — the metadata server or Workload Identity provides them:
+
+```go
+store, err := storage.NewGCSReaderFromConfig(ctx, storage.GCSConfig{},
+    "my-bucket", "archives/repo.pack")
+```
+
+> **Note:** the GCE service account (or GKE Workload Identity SA) must have the `roles/storage.objectViewer` role on the bucket.
+
+#### Running outside GCP (local dev, CI, on-prem)
+
+**Option A — `gcloud` CLI** (simplest for local dev):
+
+```bash
+gcloud auth application-default login
+```
+
+```go
+store, err := storage.NewGCSReaderFromConfig(ctx, storage.GCSConfig{},
+    "my-bucket", "archives/repo.pack")
+```
+
+**Option B — service account key file** (recommended for CI / on-prem):
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
+```
+
+```go
+// ADC picks up the env var automatically
+store, err := storage.NewGCSReaderFromConfig(ctx, storage.GCSConfig{},
+    "my-bucket", "archives/repo.pack")
+```
+
+Or pass the file path explicitly:
+
+```go
+store, err := storage.NewGCSReaderFromConfig(ctx, storage.GCSConfig{
+    CredentialsFile: "/path/to/sa-key.json",
+}, "my-bucket", "archives/repo.pack")
+```
+
+**Option C — inline JSON key** (useful when the key is stored in a secret manager):
+
+```go
+keyJSON, _ := secretmanager.GetSecret("gcs-sa-key")
+
+store, err := storage.NewGCSReaderFromConfig(ctx, storage.GCSConfig{
+    CredentialsJSON: keyJSON,
+}, "my-bucket", "archives/repo.pack")
+```
+
+#### Advanced: bring your own client
+
+```go
+client, err := storage.NewGCSClient(ctx, storage.GCSConfig{
+    CredentialsFile: "/path/to/sa-key.json",
+})
+// … or build *storage.Client however you like …
+
+bucket := client.Bucket("my-bucket")
+store := storage.NewGCSReader(bucket, "archives/repo.pack",
+    storage.WithGCSContext(ctx),
+)
+```
+
+> **Tip:** when using `NewGCSReaderFromConfig`, call `store.Close()` when done — it releases the underlying GCS client. Readers created via `NewGCSReader` have a no-op `Close`.
 
 ## File Entry Metadata
 

@@ -8,12 +8,32 @@ import (
 	"sync"
 
 	gcStorage "cloud.google.com/go/storage"
+	"google.golang.org/api/option"
 )
+
+// GCSConfig holds configuration for creating a GCS client.
+//
+// Credential resolution order:
+//  1. If CredentialsJSON is set, it is used directly (inline service account key).
+//  2. If CredentialsFile is set, the JSON key file at that path is used.
+//  3. Otherwise Application Default Credentials (ADC) are used, which covers:
+//     - GOOGLE_APPLICATION_CREDENTIALS environment variable
+//     - gcloud auth application-default login (local development)
+//     - GCE metadata server / Workload Identity (when running in GCP)
+type GCSConfig struct {
+	// CredentialsFile is the path to a service account JSON key file.
+	// Leave empty to use ADC or CredentialsJSON.
+	CredentialsFile string
+	// CredentialsJSON is the raw service account JSON key content.
+	// Takes precedence over CredentialsFile.
+	CredentialsJSON []byte
+}
 
 // GCSReader implements ObjectReader for objects stored in Google Cloud Storage.
 // It translates ReadAt calls into GCS range-read requests using the
 // cloud.google.com/go/storage client library.
 type GCSReader struct {
+	client *gcStorage.Client // non-nil when created via NewGCSReaderFromConfig
 	bucket *gcStorage.BucketHandle
 	object string
 	ctx    context.Context
@@ -31,6 +51,49 @@ type GCSOption func(*GCSReader)
 // Defaults to context.Background() if not provided.
 func WithGCSContext(ctx context.Context) GCSOption {
 	return func(r *GCSReader) { r.ctx = ctx }
+}
+
+// NewGCSClient creates a *storage.Client from the given GCSConfig.
+// When explicit credentials are provided they are used directly; otherwise
+// Application Default Credentials are used, which work both inside GCP
+// (metadata server, Workload Identity) and outside (env var, gcloud CLI).
+func NewGCSClient(ctx context.Context, cfg GCSConfig) (*gcStorage.Client, error) {
+	var opts []option.ClientOption
+
+	switch {
+	case len(cfg.CredentialsJSON) > 0:
+		opts = append(opts, option.WithCredentialsJSON(cfg.CredentialsJSON))
+	case cfg.CredentialsFile != "":
+		opts = append(opts, option.WithCredentialsFile(cfg.CredentialsFile))
+	}
+
+	client, err := gcStorage.NewClient(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("gcs: create client: %w", err)
+	}
+	return client, nil
+}
+
+// NewGCSReaderFromConfig creates an ObjectReader for the given GCS object using
+// the provided GCSConfig. This is a convenience wrapper that creates the GCS
+// client and reader in one step. The caller must call Close to release the
+// underlying client.
+func NewGCSReaderFromConfig(ctx context.Context, cfg GCSConfig, bucket, object string, opts ...GCSOption) (*GCSReader, error) {
+	client, err := NewGCSClient(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	r := &GCSReader{
+		client: client,
+		bucket: client.Bucket(bucket),
+		object: object,
+		ctx:    ctx,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r, nil
 }
 
 // NewGCSReader creates an ObjectReader backed by the given GCS object.
@@ -82,7 +145,11 @@ func (r *GCSReader) Size() (int64, error) {
 	return r.size, r.sizeErr
 }
 
-// Close is a no-op for GCS (no persistent connection to release).
+// Close releases the underlying GCS client if one was created via
+// NewGCSReaderFromConfig. For readers created with NewGCSReader this is a no-op.
 func (r *GCSReader) Close() error {
+	if r.client != nil {
+		return r.client.Close()
+	}
 	return nil
 }
