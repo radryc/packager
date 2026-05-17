@@ -1,0 +1,200 @@
+package packager
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/radryc/packager/pipeline"
+)
+
+// AddFileOptions controls per-file behaviour when adding a file to an archive.
+type AddFileOptions struct {
+	// Permission stores Unix permission bits (e.g. 0644, 0755).
+	Permission uint32
+	// OwnerUID is the numeric user ID of the file owner.
+	OwnerUID int
+	// Encrypt controls whether the file data is AEAD-encrypted.
+	// The zero value is false (no encryption). Use DefaultAddFileOptions
+	// to get encryption enabled by default.
+	Encrypt bool
+	// ForceCompress overrides automatic pre-compressed detection.
+	// nil  → auto-detect (skip compression for already-compressed formats).
+	// true → always compress.  false → never compress.
+	ForceCompress *bool
+	// FileType indicates whether this is a regular file (0), directory (1),
+	// or symlink (2). Defaults to FileTypeRegular.
+	FileType FileType
+	// LinkTarget is the symlink destination path. Only used when
+	// FileType == FileTypeSymlink.
+	LinkTarget string
+}
+
+// DefaultAddFileOptions returns sensible defaults: 0644 perms, UID 0,
+// encryption enabled, auto-detect compression.
+func DefaultAddFileOptions() AddFileOptions {
+	return AddFileOptions{
+		Permission: 0644,
+		OwnerUID:   0,
+		Encrypt:    true,
+	}
+}
+
+// ArchiveWriter builds a WORM archive sequentially. Files are packed and
+// appended one at a time. Call Close to finalise the archive (writes the
+// encrypted master index and 8-byte footer).
+//
+// ArchiveWriter is NOT safe for concurrent use. All AddFile/Delete/Close
+// calls must be serialised by the caller.
+type ArchiveWriter struct {
+	writer        io.Writer
+	pipeline      *pipeline.Pipeline
+	index         *PathIndex
+	currentOffset int64
+	closed        bool
+}
+
+// NewArchiveWriter creates a new archive writer that writes to w.
+func NewArchiveWriter(w io.Writer, p *pipeline.Pipeline) *ArchiveWriter {
+	return &ArchiveWriter{
+		writer:        w,
+		pipeline:      p,
+		index:         NewPathIndex(),
+		currentOffset: 0,
+	}
+}
+
+// AddFile compresses, optionally encrypts, and appends a file to the archive.
+// archivePath (full path including directories) is used as the index key.
+// Compression is automatically skipped for files that are already in a
+// compressed format (detected by extension and magic bytes) unless overridden
+// via opts.ForceCompress.
+//
+// archivePath must be a non-empty, relative, clean path. Absolute paths and
+// paths containing ".." components are rejected to prevent path traversal.
+func (aw *ArchiveWriter) AddFile(archivePath string, rawData []byte, opts AddFileOptions) error {
+	if aw.closed {
+		return errors.New("AddFile called on a closed ArchiveWriter")
+	}
+	if err := validateArchivePath(archivePath); err != nil {
+		return err
+	}
+
+	// For directories, store zero bytes (the directory itself has no content).
+	if opts.FileType == FileTypeDir {
+		rawData = nil
+	}
+
+	// For symlinks, store the link target as content if rawData is nil/empty.
+	if opts.FileType == FileTypeSymlink && len(rawData) == 0 && opts.LinkTarget != "" {
+		rawData = []byte(opts.LinkTarget)
+	}
+
+	// Determine whether to compress
+	compress := true
+	if opts.ForceCompress != nil {
+		compress = *opts.ForceCompress
+	} else {
+		if IsPreCompressed(archivePath, rawData) {
+			compress = false
+		}
+	}
+
+	// Pack (compress + encrypt based on flags)
+	packedData, err := aw.pipeline.Pack(rawData, compress, opts.Encrypt)
+	if err != nil {
+		return fmt.Errorf("pack %q: %w", archivePath, err)
+	}
+
+	n, err := aw.writer.Write(packedData)
+	if err != nil {
+		return fmt.Errorf("write %q: %w", archivePath, err)
+	}
+
+	aw.index.Put(archivePath, FileEntry{
+		Offset:       aw.currentOffset,
+		Size:         int64(n),
+		Permission:   opts.Permission,
+		OwnerUID:     opts.OwnerUID,
+		IsEncrypted:  opts.Encrypt,
+		IsCompressed: compress,
+		FileType:     opts.FileType,
+	})
+
+	aw.currentOffset += int64(n)
+	return nil
+}
+
+// validateArchivePath rejects paths that are empty, absolute, or contain ".."
+// components, which could cause path traversal vulnerabilities on extraction.
+func validateArchivePath(p string) error {
+	if p == "" {
+		return errors.New("archive path must not be empty")
+	}
+	if strings.HasPrefix(p, "/") {
+		return fmt.Errorf("archive path must be relative, got absolute path %q", p)
+	}
+	for _, component := range strings.Split(p, "/") {
+		if component == ".." {
+			return fmt.Errorf("archive path must not contain '..': %q", p)
+		}
+	}
+	return nil
+}
+
+// Delete records a tombstone entry for the given archivePath. No data is written
+// to the archive — the index simply gains a zero-size entry with IsDeleted
+// set to true. Readers treat deleted entries as non-existent.
+// Returns an error if the writer has already been closed.
+func (aw *ArchiveWriter) Delete(archivePath string) error {
+	if aw.closed {
+		return errors.New("Delete called on a closed ArchiveWriter")
+	}
+	aw.index.Put(archivePath, FileEntry{
+		Offset:    aw.currentOffset,
+		Size:      0,
+		IsDeleted: true,
+	})
+	return nil
+}
+
+// Close finalises the archive by writing the encrypted master index and
+// the 8-byte little-endian footer. The master index is always compressed
+// and encrypted regardless of per-file settings.
+// Close is idempotent with respect to errors but must only be called once:
+// a second call returns an error immediately without writing anything.
+func (aw *ArchiveWriter) Close() error {
+	if aw.closed {
+		return errors.New("Close called on an already-closed ArchiveWriter")
+	}
+	aw.closed = true
+
+	// Serialise the index to JSON
+	indexBytes, err := json.Marshal(aw.index)
+	if err != nil {
+		return fmt.Errorf("marshal index: %w", err)
+	}
+
+	// The index is always compressed + encrypted
+	packedIndex, err := aw.pipeline.Pack(indexBytes, true, true)
+	if err != nil {
+		return fmt.Errorf("pack index: %w", err)
+	}
+
+	indexSize, err := aw.writer.Write(packedIndex)
+	if err != nil {
+		return fmt.Errorf("write index: %w", err)
+	}
+
+	// Write the 8-byte LE footer containing the packed index size
+	footer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(footer, uint64(indexSize))
+	if _, err := aw.writer.Write(footer); err != nil {
+		return fmt.Errorf("write footer: %w", err)
+	}
+
+	return nil
+}

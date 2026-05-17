@@ -1,0 +1,662 @@
+package packager
+
+import (
+	"bytes"
+	"crypto/rand"
+	"testing"
+
+	"github.com/radryc/packager/pipeline"
+	"github.com/radryc/packager/storage"
+)
+
+func testKey(t *testing.T) []byte {
+	t.Helper()
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestWriteReadRoundTrip(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ---------- Write archive ----------
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	files := []struct {
+		path string
+		data []byte
+		opts AddFileOptions
+	}{
+		{
+			path: "src/main.go",
+			data: []byte("package main\n\nfunc main() { println(\"hello\") }\n"),
+			opts: AddFileOptions{Permission: 0644, OwnerUID: 1000, Encrypt: true},
+		},
+		{
+			path: "docs/readme.txt",
+			data: []byte("This is the readme for the project.\nIt has multiple lines.\n"),
+			opts: AddFileOptions{Permission: 0644, OwnerUID: 1000, Encrypt: true},
+		},
+		{
+			// PNG file: should auto-detect as pre-compressed → skip zstd
+			path: "assets/logo.png",
+			data: append([]byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, bytes.Repeat([]byte{0xAB}, 100)...),
+			opts: AddFileOptions{Permission: 0444, OwnerUID: 0, Encrypt: true},
+		},
+		{
+			// Unencrypted JSON config
+			path: "config/settings.json",
+			data: []byte(`{"port": 8080, "debug": false, "db": "postgres://localhost/app"}`),
+			opts: AddFileOptions{Permission: 0600, OwnerUID: 0, Encrypt: false},
+		},
+	}
+
+	for _, f := range files {
+		if err := w.AddFile(f.path, f.data, f.opts); err != nil {
+			t.Fatalf("AddFile(%q): %v", f.path, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// ---------- Read archive ----------
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer ar.Close()
+
+	// Verify every file round-trips correctly
+	for _, f := range files {
+		data, entry, err := ar.GetFile(f.path)
+		if err != nil {
+			t.Fatalf("GetFile(%q): %v", f.path, err)
+		}
+		if !bytes.Equal(data, f.data) {
+			t.Errorf("GetFile(%q): data mismatch (got %d bytes, want %d)", f.path, len(data), len(f.data))
+		}
+
+		// Check metadata
+		if entry.Permission != f.opts.Permission {
+			t.Errorf("%q: permission = %o, want %o", f.path, entry.Permission, f.opts.Permission)
+		}
+		if entry.OwnerUID != f.opts.OwnerUID {
+			t.Errorf("%q: ownerUID = %d, want %d", f.path, entry.OwnerUID, f.opts.OwnerUID)
+		}
+		if entry.IsEncrypted != f.opts.Encrypt {
+			t.Errorf("%q: isEncrypted = %v, want %v", f.path, entry.IsEncrypted, f.opts.Encrypt)
+		}
+	}
+
+	// PNG should NOT be compressed (auto-detected)
+	pngEntry, ok := ar.GetEntry("assets/logo.png")
+	if !ok {
+		t.Fatal("PNG entry not found")
+	}
+	if pngEntry.IsCompressed {
+		t.Error("PNG should have IsCompressed=false (auto-detected as pre-compressed)")
+	}
+
+	// Text files SHOULD be compressed
+	goEntry, ok := ar.GetEntry("src/main.go")
+	if !ok {
+		t.Fatal("Go entry not found")
+	}
+	if !goEntry.IsCompressed {
+		t.Error("Go source should have IsCompressed=true")
+	}
+
+	// Unencrypted config
+	cfgEntry, ok := ar.GetEntry("config/settings.json")
+	if !ok {
+		t.Fatal("JSON config entry not found")
+	}
+	if cfgEntry.IsEncrypted {
+		t.Error("JSON config should have IsEncrypted=false")
+	}
+}
+
+func TestListFiles(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	paths := []string{"z/last.txt", "a/first.txt", "m/middle.txt"}
+	opts := DefaultAddFileOptions()
+	for _, path := range paths {
+		if err := w.AddFile(path, []byte("content"), opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	listed := ar.ListFiles()
+	if len(listed) != 3 {
+		t.Fatalf("ListFiles: got %d, want 3", len(listed))
+	}
+	// Should be sorted
+	if listed[0] != "a/first.txt" || listed[1] != "m/middle.txt" || listed[2] != "z/last.txt" {
+		t.Errorf("ListFiles not sorted: %v", listed)
+	}
+}
+
+func TestGetFileNotFound(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+	if err := w.AddFile("exists.txt", []byte("data"), DefaultAddFileOptions()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	_, _, err = ar.GetFile("does-not-exist.txt")
+	if err == nil {
+		t.Fatal("expected error for non-existent file")
+	}
+}
+
+func TestWithIndexSizeOption(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+	if err := w.AddFile("test.txt", []byte("hello"), DefaultAddFileOptions()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	archiveBytes := buf.Bytes()
+	totalSize := int64(len(archiveBytes))
+
+	// Read the footer to get the index size (so we can pass it via option)
+	footerBytes := archiveBytes[totalSize-8:]
+	indexSize := int64(footerBytes[0]) | int64(footerBytes[1])<<8 | int64(footerBytes[2])<<16 | int64(footerBytes[3])<<24 |
+		int64(footerBytes[4])<<32 | int64(footerBytes[5])<<40 | int64(footerBytes[6])<<48 | int64(footerBytes[7])<<56
+
+	reader := storage.NewMemReader(archiveBytes)
+	ar, err := OpenArchive(reader, p, WithIndexSize(indexSize))
+	if err != nil {
+		t.Fatalf("OpenArchive with WithIndexSize: %v", err)
+	}
+	defer ar.Close()
+
+	data, _, err := ar.GetFile("test.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("got %q, want %q", data, "hello")
+	}
+}
+
+func TestForceCompress(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Force compress a PNG (normally skipped)
+	forceTrue := true
+	pngData := append([]byte{0x89, 0x50, 0x4E, 0x47}, bytes.Repeat([]byte{0x00}, 50)...)
+	opts := AddFileOptions{Permission: 0644, Encrypt: true, ForceCompress: &forceTrue}
+	if err := w.AddFile("forced.png", pngData, opts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force NO compression on a text file (normally compressed)
+	forceFalse := false
+	opts2 := AddFileOptions{Permission: 0644, Encrypt: true, ForceCompress: &forceFalse}
+	if err := w.AddFile("uncompressed.txt", []byte("lots of text"), opts2); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	pngEntry, ok := ar.GetEntry("forced.png")
+	if !ok {
+		t.Fatal("forced.png not found")
+	}
+	if !pngEntry.IsCompressed {
+		t.Error("forced.png should be compressed (ForceCompress=true)")
+	}
+
+	txtEntry, ok := ar.GetEntry("uncompressed.txt")
+	if !ok {
+		t.Fatal("uncompressed.txt not found")
+	}
+	if txtEntry.IsCompressed {
+		t.Error("uncompressed.txt should NOT be compressed (ForceCompress=false)")
+	}
+
+	// Verify data integrity
+	data, _, err := ar.GetFile("forced.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, pngData) {
+		t.Error("forced.png data mismatch")
+	}
+
+	data, _, err = ar.GetFile("uncompressed.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "lots of text" {
+		t.Error("uncompressed.txt data mismatch")
+	}
+}
+
+func TestEmptyArchive(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatalf("OpenArchive on empty: %v", err)
+	}
+	defer ar.Close()
+
+	if files := ar.ListFiles(); len(files) != 0 {
+		t.Errorf("expected 0 files, got %d", len(files))
+	}
+}
+
+func TestIndexCopy(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+	if err := w.AddFile("a.txt", []byte("aaa"), DefaultAddFileOptions()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	idx := ar.Index()
+	// Mutating the copy should not affect the reader
+	delete(idx, "a.txt")
+
+	_, ok := ar.GetEntry("a.txt")
+	if !ok {
+		t.Error("GetEntry should still find a.txt after external index mutation")
+	}
+}
+
+func TestDeleteFile(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	opts := DefaultAddFileOptions()
+	if err := w.AddFile("keep.txt", []byte("keeper"), opts); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddFile("remove.txt", []byte("gone"), opts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark remove.txt as deleted
+	if err := w.Delete("remove.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// Deleted file should not be retrievable
+	_, _, err = ar.GetFile("remove.txt")
+	if err == nil {
+		t.Fatal("expected error for deleted file")
+	}
+
+	// Deleted file should not appear in GetEntry
+	_, ok := ar.GetEntry("remove.txt")
+	if ok {
+		t.Error("GetEntry should return false for deleted file")
+	}
+
+	// Deleted file should not appear in ListFiles
+	listed := ar.ListFiles()
+	for _, f := range listed {
+		if f == "remove.txt" {
+			t.Error("deleted file should not appear in ListFiles")
+		}
+	}
+	if len(listed) != 1 || listed[0] != "keep.txt" {
+		t.Errorf("expected [keep.txt], got %v", listed)
+	}
+
+	// Non-deleted file still works
+	data, _, err := ar.GetFile("keep.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "keeper" {
+		t.Errorf("got %q, want %q", data, "keeper")
+	}
+}
+
+func TestDeleteOnlyFile(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Delete a file that was never added (pure tombstone)
+	if err := w.Delete("phantom.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	if files := ar.ListFiles(); len(files) != 0 {
+		t.Errorf("expected 0 listed files, got %v", files)
+	}
+
+	_, _, err = ar.GetFile("phantom.txt")
+	if err == nil {
+		t.Fatal("expected error for deleted phantom file")
+	}
+}
+
+func TestDirectoryEntry(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Add a directory entry
+	dirOpts := AddFileOptions{Permission: 0755, OwnerUID: 0, Encrypt: true, FileType: FileTypeDir}
+	if err := w.AddFile("src/", nil, dirOpts); err != nil {
+		t.Fatalf("AddFile dir: %v", err)
+	}
+
+	// Add a regular file inside that directory
+	fileOpts := DefaultAddFileOptions()
+	if err := w.AddFile("src/main.go", []byte("package main\n"), fileOpts); err != nil {
+		t.Fatalf("AddFile regular: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// Directory should return nil data
+	data, entry, err := ar.GetFile("src/")
+	if err != nil {
+		t.Fatalf("GetFile(dir): %v", err)
+	}
+	if data != nil {
+		t.Errorf("directory data should be nil, got %d bytes", len(data))
+	}
+	if entry.FileType != FileTypeDir {
+		t.Errorf("FileType = %d, want %d (FileTypeDir)", entry.FileType, FileTypeDir)
+	}
+	if entry.Permission != 0755 {
+		t.Errorf("Permission = %o, want 0755", entry.Permission)
+	}
+
+	// Regular file still works
+	data, entry, err = ar.GetFile("src/main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "package main\n" {
+		t.Errorf("got %q, want %q", data, "package main\n")
+	}
+	if entry.FileType != FileTypeRegular {
+		t.Errorf("FileType = %d, want %d (FileTypeRegular)", entry.FileType, FileTypeRegular)
+	}
+
+	// Both entries should appear in ListFiles
+	listed := ar.ListFiles()
+	if len(listed) != 2 {
+		t.Fatalf("ListFiles: got %d entries, want 2", len(listed))
+	}
+}
+
+func TestSymlinkEntry(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Add a symlink entry (LinkTarget used as content)
+	linkOpts := AddFileOptions{
+		Permission: 0777,
+		OwnerUID:   1000,
+		Encrypt:    true,
+		FileType:   FileTypeSymlink,
+		LinkTarget: "../real/target.txt",
+	}
+	if err := w.AddFile("link.txt", nil, linkOpts); err != nil {
+		t.Fatalf("AddFile symlink: %v", err)
+	}
+
+	// Add a symlink with explicit rawData (should use rawData, not LinkTarget)
+	linkOpts2 := AddFileOptions{
+		Permission: 0777,
+		Encrypt:    true,
+		FileType:   FileTypeSymlink,
+		LinkTarget: "ignored-target",
+	}
+	if err := w.AddFile("link2.txt", []byte("explicit-target"), linkOpts2); err != nil {
+		t.Fatalf("AddFile symlink with data: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := storage.NewMemReader(buf.Bytes())
+	ar, err := OpenArchive(reader, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+
+	// First symlink: link target stored as data
+	data, entry, err := ar.GetFile("link.txt")
+	if err != nil {
+		t.Fatalf("GetFile(symlink): %v", err)
+	}
+	if string(data) != "../real/target.txt" {
+		t.Errorf("symlink data = %q, want %q", data, "../real/target.txt")
+	}
+	if entry.FileType != FileTypeSymlink {
+		t.Errorf("FileType = %d, want %d (FileTypeSymlink)", entry.FileType, FileTypeSymlink)
+	}
+
+	// Second symlink: explicit rawData takes precedence
+	data, entry, err = ar.GetFile("link2.txt")
+	if err != nil {
+		t.Fatalf("GetFile(symlink2): %v", err)
+	}
+	if string(data) != "explicit-target" {
+		t.Errorf("symlink2 data = %q, want %q", data, "explicit-target")
+	}
+	if entry.FileType != FileTypeSymlink {
+		t.Errorf("FileType = %d, want %d (FileTypeSymlink)", entry.FileType, FileTypeSymlink)
+	}
+}
+
+func TestDoubleCloseErrors(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+	if err := w.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := w.Close(); err == nil {
+		t.Fatal("expected error on second Close, got nil")
+	}
+}
+
+func TestAddFileAfterCloseErrors(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddFile("late.txt", []byte("data"), DefaultAddFileOptions()); err == nil {
+		t.Fatal("expected error from AddFile after Close, got nil")
+	}
+}
+
+func TestAddFilePathValidation(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"empty path", ""},
+		{"absolute path", "/etc/passwd"},
+		{"dotdot component", "../../etc/passwd"},
+		{"dotdot at root", "../secret"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := NewArchiveWriter(&buf, p)
+			if err := w.AddFile(tc.path, []byte("x"), DefaultAddFileOptions()); err == nil {
+				t.Errorf("expected error for path %q, got nil", tc.path)
+			}
+		})
+	}
+}
