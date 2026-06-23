@@ -22,11 +22,11 @@ import (
 // nameIdx table maps (dirID, basename) → slice index in byDir[dirID],
 // eliminating the previous O(n) linear scan over per-directory file lists.
 type PathIndex struct {
-	dirs      []string            // unique dir paths; index = dirID
-	dirLookup map[string]uint32   // dir string → dirID (O(1) lookup)
-	byDir     [][]baseEntry       // byDir[dirID] = ordered file list for that dir
-	nameIdx   []map[string]int    // nameIdx[dirID][basename] = index into byDir[dirID]
-	count     int                 // total number of file entries
+	dirs      []string          // unique dir paths; index = dirID
+	dirLookup map[string]uint32 // dir string → dirID (O(1) lookup)
+	byDir     [][]baseEntry     // byDir[dirID] = ordered file list for that dir
+	nameIdx   []map[string]int  // nameIdx[dirID][basename] = index into byDir[dirID]
+	count     int               // total number of file entries
 }
 
 // baseEntry holds a single file within a directory.
