@@ -9,7 +9,6 @@ import (
 // Compile-time check: nameIdx must exist and have the same length as byDir/dirs
 // after Put operations (verified via internal state access in the _test package).
 
-
 func TestPathIndexPutGet(t *testing.T) {
 	pi := NewPathIndex()
 
