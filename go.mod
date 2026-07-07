@@ -1,7 +1,6 @@
 module github.com/radryc/packager
 
-go 1.26.0
-toolchain go1.26.3
+go 1.26.4
 require (
 	cloud.google.com/go/storage v1.60.0
 	github.com/aws/aws-sdk-go-v2 v1.41.4
