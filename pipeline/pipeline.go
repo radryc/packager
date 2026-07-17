@@ -7,10 +7,20 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/crypto/chacha20poly1305"
+)
+
+// Sentinel errors allow callers to distinguish encryption/decryption failures
+// from other I/O or format errors using errors.Is.
+var (
+	ErrEncryption   = errors.New("encryption error")
+	ErrDecryption   = errors.New("decryption/authentication error: wrong key or corrupted data")
+	ErrCompression  = errors.New("compression error")
+	ErrDecompression = errors.New("decompression error")
 )
 
 // Pipeline manages shared resources for compression and encryption.
@@ -61,7 +71,11 @@ func (p *Pipeline) Compress(data []byte) []byte {
 
 // Decompress reverses zstd compression.
 func (p *Pipeline) Decompress(data []byte) ([]byte, error) {
-	return p.decoder.DecodeAll(data, nil)
+	out, err := p.decoder.DecodeAll(data, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDecompression, err)
+	}
+	return out, nil
 }
 
 // Encrypt applies ChaCha20-Poly1305 AEAD encryption.
@@ -80,10 +94,14 @@ func (p *Pipeline) Encrypt(data []byte) ([]byte, error) {
 func (p *Pipeline) Decrypt(data []byte) ([]byte, error) {
 	nonceSize := p.aead.NonceSize()
 	if len(data) < nonceSize {
-		return nil, errors.New("payload too short to contain nonce")
+		return nil, fmt.Errorf("%w: payload too short to contain nonce", ErrDecryption)
 	}
 	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
-	return p.aead.Open(nil, nonce, ciphertext, nil)
+	out, err := p.aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDecryption, err)
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

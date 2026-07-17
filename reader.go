@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 
@@ -75,7 +76,7 @@ func OpenArchive(store storage.ObjectReader, p *pipeline.Pipeline, opts ...OpenO
 	// Index is always compressed + encrypted
 	rawIndex, err := p.Unpack(encryptedIndex, true, true)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open archive: %w", err)
 	}
 
 	index := NewPathIndex()
@@ -109,7 +110,7 @@ func (ar *ArchiveReader) GetFile(filepath string) ([]byte, *FileEntry, error) {
 
 	rawData, err := ar.pipeline.Unpack(encryptedData, entry.IsCompressed, entry.IsEncrypted)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("get file %q: %w", filepath, err)
 	}
 
 	return rawData, &entry, nil
