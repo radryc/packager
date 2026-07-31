@@ -43,12 +43,17 @@ func NewPipeline(key []byte) (*Pipeline, error) {
 		return nil, err
 	}
 
-	encoder, err := zstd.NewWriter(nil)
+	encoder, err := zstd.NewWriter(nil,
+		zstd.WithWindowSize(1<<20),
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	decoder, err := zstd.NewReader(nil)
+	decoder, err := zstd.NewReader(nil,
+		zstd.WithDecoderMaxWindow(1<<20),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +63,35 @@ func NewPipeline(key []byte) (*Pipeline, error) {
 		encoder: encoder,
 		decoder: decoder,
 	}, nil
+}
+
+// Close releases the encoder and decoder resources. The Pipeline must not be
+// used after Close is called.
+func (p *Pipeline) Close() {
+	if p.encoder != nil {
+		_ = p.encoder.Close()
+		p.encoder = nil
+	}
+	if p.decoder != nil {
+		p.decoder.Close()
+		p.decoder = nil
+	}
+}
+
+// ResetEncoder clears the encoder's internal history buffer. Call this
+// between independent batches (e.g. between archives) to prevent history
+// accumulation from inflating memory usage without benefiting compression.
+func (p *Pipeline) ResetEncoder() {
+	if p.encoder != nil {
+		_ = p.encoder.Close()
+		encoder, err := zstd.NewWriter(nil,
+			zstd.WithWindowSize(1<<20),
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+		)
+		if err == nil {
+			p.encoder = encoder
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
