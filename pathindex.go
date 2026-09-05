@@ -1,0 +1,258 @@
+package packager
+
+import (
+	"encoding/json"
+	"fmt"
+	"path"
+	"sort"
+)
+
+// PathIndex stores file entries with directory-prefix deduplication.
+//
+// Instead of storing full paths as map keys — O(N × avg_path_len) memory —
+// unique directory prefixes are stored once in a shared table and each entry
+// retains only its basename. For N files across D unique directories the
+// path memory drops to O(D × avg_dir_len + N × avg_basename_len).
+//
+// Example: 100 000 files in 500 directories with avg 50-byte dir prefixes
+// and avg 12-byte basenames stores ~25 KB of dir strings + ~1.2 MB of
+// basenames rather than ~6.2 MB of full paths.
+//
+// Lookup complexity: both Put and Get are O(1) average-case. The secondary
+// nameIdx table maps (dirID, basename) → slice index in byDir[dirID],
+// eliminating the previous O(n) linear scan over per-directory file lists.
+type PathIndex struct {
+	dirs      []string            // unique dir paths; index = dirID
+	dirLookup map[string]uint32   // dir string → dirID (O(1) lookup)
+	byDir     [][]baseEntry       // byDir[dirID] = ordered file list for that dir
+	nameIdx   []map[string]int    // nameIdx[dirID][basename] = index into byDir[dirID]
+	count     int                 // total number of file entries
+}
+
+// baseEntry holds a single file within a directory.
+type baseEntry struct {
+	name  string    // basename only (e.g. "file.go")
+	entry FileEntry // full metadata + archive location
+}
+
+// NewPathIndex creates an empty index.
+func NewPathIndex() *PathIndex {
+	return &PathIndex{
+		dirLookup: make(map[string]uint32),
+	}
+}
+
+// addDir registers a new directory and returns its dirID.
+// Must only be called when the directory is not yet in dirLookup.
+func (pi *PathIndex) addDir(dir string) uint32 {
+	dirID := uint32(len(pi.dirs))
+	pi.dirs = append(pi.dirs, dir)
+	pi.byDir = append(pi.byDir, nil)
+	pi.nameIdx = append(pi.nameIdx, make(map[string]int))
+	pi.dirLookup[dir] = dirID
+	return dirID
+}
+
+// splitPath separates a full path into (directory, basename).
+//
+//	"a/b/file.go" → ("a/b", "file.go")
+//	"file.go"     → ("", "file.go")
+func splitPath(fullPath string) (dir, name string) {
+	dir = path.Dir(fullPath)
+	name = path.Base(fullPath)
+	if dir == "." {
+		dir = ""
+	}
+	return
+}
+
+// joinPath reconstructs a full path from dir + basename.
+func joinPath(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
+}
+
+// Put adds or replaces a file entry in the index. O(1) average-case.
+func (pi *PathIndex) Put(fullPath string, entry FileEntry) {
+	dir, name := splitPath(fullPath)
+
+	dirID, exists := pi.dirLookup[dir]
+	if !exists {
+		dirID = pi.addDir(dir)
+	}
+
+	// O(1) replace via nameIdx.
+	if idx, found := pi.nameIdx[dirID][name]; found {
+		pi.byDir[dirID][idx].entry = entry
+		return
+	}
+
+	// New entry: append and record its index.
+	pi.nameIdx[dirID][name] = len(pi.byDir[dirID])
+	pi.byDir[dirID] = append(pi.byDir[dirID], baseEntry{name: name, entry: entry})
+	pi.count++
+}
+
+// Get retrieves a file entry by full path. Returns false if not found.
+// O(1) average-case via the nameIdx secondary table.
+func (pi *PathIndex) Get(fullPath string) (FileEntry, bool) {
+	dir, name := splitPath(fullPath)
+
+	dirID, exists := pi.dirLookup[dir]
+	if !exists {
+		return FileEntry{}, false
+	}
+	idx, found := pi.nameIdx[dirID][name]
+	if !found {
+		return FileEntry{}, false
+	}
+	return pi.byDir[dirID][idx].entry, true
+}
+
+// Len returns the total number of files in the index.
+func (pi *PathIndex) Len() int {
+	return pi.count
+}
+
+// List returns a sorted slice of all full file paths.
+func (pi *PathIndex) List() []string {
+	paths := make([]string, 0, pi.count)
+	for dirID, files := range pi.byDir {
+		dir := pi.dirs[dirID]
+		for _, f := range files {
+			paths = append(paths, joinPath(dir, f.name))
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// ForEach calls fn for every entry. Iteration order is not guaranteed.
+func (pi *PathIndex) ForEach(fn func(fullPath string, entry FileEntry)) {
+	for dirID, files := range pi.byDir {
+		dir := pi.dirs[dirID]
+		for _, f := range files {
+			fn(joinPath(dir, f.name), f.entry)
+		}
+	}
+}
+
+// ToMap returns a flat map[string]FileEntry copy of the index.
+// Useful for callers that need a simple map view.
+func (pi *PathIndex) ToMap() map[string]FileEntry {
+	m := make(map[string]FileEntry, pi.count)
+	pi.ForEach(func(fullPath string, entry FileEntry) {
+		m[fullPath] = entry
+	})
+	return m
+}
+
+// ---------------------------------------------------------------------------
+// Serialisation — prefix-table format
+// ---------------------------------------------------------------------------
+//
+// On-disk layout (JSON before zstd+AEAD):
+//
+//	{
+//	  "d": ["dir/a", "dir/b", ...],
+//	  "f": [
+//	    {"d":0,"n":"file.go","o":0,"s":123,"p":420,"u":1000,"e":true,"c":true},
+//	    ...
+//	  ]
+//	}
+//
+// Directory strings appear once in the "d" array. Each file references its
+// directory by index, storing only the basename. This makes the pre-compression
+// JSON significantly smaller when many files share common directory prefixes.
+
+type serializedIndex struct {
+	Dirs  []string         `json:"d"`
+	Files []serializedFile `json:"f"`
+}
+
+type serializedFile struct {
+	DirID        uint32   `json:"d"`
+	Name         string   `json:"n"`
+	Offset       int64    `json:"o"`
+	Size         int64    `json:"s"`
+	Permission   uint32   `json:"p"`
+	OwnerUID     int      `json:"u"`
+	IsEncrypted  bool     `json:"e,omitempty"`
+	IsCompressed bool     `json:"c,omitempty"`
+	IsDeleted    bool     `json:"del,omitempty"`
+	FileType     FileType `json:"t,omitempty"`
+}
+
+// MarshalJSON serialises the PathIndex using the prefix-table format.
+func (pi *PathIndex) MarshalJSON() ([]byte, error) {
+	si := serializedIndex{
+		Dirs:  pi.dirs,
+		Files: make([]serializedFile, 0, pi.count),
+	}
+	if si.Dirs == nil {
+		si.Dirs = []string{}
+	}
+	for dirID, files := range pi.byDir {
+		for _, f := range files {
+			si.Files = append(si.Files, serializedFile{
+				DirID:        uint32(dirID),
+				Name:         f.name,
+				Offset:       f.entry.Offset,
+				Size:         f.entry.Size,
+				Permission:   f.entry.Permission,
+				OwnerUID:     f.entry.OwnerUID,
+				IsEncrypted:  f.entry.IsEncrypted,
+				IsCompressed: f.entry.IsCompressed,
+				IsDeleted:    f.entry.IsDeleted,
+				FileType:     f.entry.FileType,
+			})
+		}
+	}
+	return json.Marshal(si)
+}
+
+// UnmarshalJSON deserialises from the prefix-table format.
+func (pi *PathIndex) UnmarshalJSON(data []byte) error {
+	var si serializedIndex
+	if err := json.Unmarshal(data, &si); err != nil {
+		return err
+	}
+
+	n := len(si.Dirs)
+	pi.dirs = si.Dirs
+	pi.dirLookup = make(map[string]uint32, n)
+	pi.byDir = make([][]baseEntry, n)
+	pi.nameIdx = make([]map[string]int, n)
+	pi.count = 0
+
+	for i, dir := range si.Dirs {
+		pi.dirLookup[dir] = uint32(i)
+		pi.nameIdx[i] = make(map[string]int)
+	}
+
+	for _, f := range si.Files {
+		if int(f.DirID) >= len(pi.dirs) {
+			return fmt.Errorf("invalid dir ID %d (only %d dirs)", f.DirID, len(pi.dirs))
+		}
+		idx := len(pi.byDir[f.DirID])
+		pi.nameIdx[f.DirID][f.Name] = idx
+		pi.byDir[f.DirID] = append(pi.byDir[f.DirID], baseEntry{
+			name: f.Name,
+			entry: FileEntry{
+				Offset:       f.Offset,
+				Size:         f.Size,
+				Permission:   f.Permission,
+				OwnerUID:     f.OwnerUID,
+				IsEncrypted:  f.IsEncrypted,
+				IsCompressed: f.IsCompressed,
+				IsDeleted:    f.IsDeleted,
+				FileType:     f.FileType,
+			},
+		})
+		pi.count++
+	}
+
+	return nil
+}
