@@ -3,6 +3,7 @@ package packager
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"testing"
 
 	"github.com/radryc/packager/pipeline"
@@ -27,7 +28,11 @@ func TestWriteReadRoundTrip(t *testing.T) {
 
 	// ---------- Write archive ----------
 	var buf bytes.Buffer
-	w := NewArchiveWriter(&buf, p)
+
+	// This test also covers legacy-compatible plaintext files, so the writer
+	// is explicitly put into compatibility mode. New writers encrypt and
+	// require encryption by default.
+	w := NewArchiveWriter(&buf, p, WithEncryptByDefault(false), WithRequireEncryption(false))
 
 	files := []struct {
 		path string
@@ -658,5 +663,148 @@ func TestAddFilePathValidation(t *testing.T) {
 				t.Errorf("expected error for path %q, got nil", tc.path)
 			}
 		})
+	}
+}
+
+func TestWriterEncryptsByDefault(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secret := []byte("super-secret-plaintext-marker")
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	// Zero-value options must still produce encrypted data.
+	if err := w.AddFile("secret.txt", secret, AddFileOptions{Permission: 0600}); err != nil {
+		t.Fatalf("AddFile with zero-value options: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if bytes.Contains(buf.Bytes(), secret) {
+		t.Fatal("archive contains plaintext although encryption is the default")
+	}
+
+	ar, err := OpenArchive(storage.NewMemReader(buf.Bytes()), p)
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer ar.Close()
+
+	data, entry, err := ar.GetFile("secret.txt")
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !bytes.Equal(data, secret) {
+		t.Fatal("round-trip data mismatch")
+	}
+	if !entry.IsEncrypted {
+		t.Error("entry.IsEncrypted = false, want true by default")
+	}
+}
+
+func TestWriterRejectsPlaintextByDefault(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p)
+
+	if err := w.AddFile("plain.txt", []byte("data"), AddFileOptions{NoEncrypt: true}); !errors.Is(err, ErrEncryptionRequired) {
+		t.Fatalf("AddFile(NoEncrypt) error = %v, want ErrEncryptionRequired", err)
+	}
+
+	if err := w.AddFile("conflict.txt", []byte("data"), AddFileOptions{Encrypt: true, NoEncrypt: true}); err == nil {
+		t.Fatal("AddFile with Encrypt and NoEncrypt succeeded, want error")
+	}
+
+	// A writer that disables the default but still requires encryption must
+	// refuse plaintext as well.
+	var buf2 bytes.Buffer
+	w2 := NewArchiveWriter(&buf2, p, WithEncryptByDefault(false))
+	if err := w2.AddFile("plain.txt", []byte("data"), AddFileOptions{}); !errors.Is(err, ErrEncryptionRequired) {
+		t.Fatalf("AddFile(default=false, require=true) error = %v, want ErrEncryptionRequired", err)
+	}
+}
+
+func TestWriterExplicitLegacyPlaintext(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	w := NewArchiveWriter(&buf, p, WithEncryptByDefault(false), WithRequireEncryption(false))
+	if err := w.AddFile("legacy.txt", []byte("legacy-plaintext"), AddFileOptions{Permission: 0644}); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Old unencrypted archives must remain readable.
+	ar, err := OpenArchive(storage.NewMemReader(buf.Bytes()), p)
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer ar.Close()
+
+	data, entry, err := ar.GetFile("legacy.txt")
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if string(data) != "legacy-plaintext" {
+		t.Errorf("data = %q, want %q", data, "legacy-plaintext")
+	}
+	if entry.IsEncrypted {
+		t.Error("legacy plaintext entry.IsEncrypted = true, want false")
+	}
+}
+
+func TestWriterPerFilePlaintextOptOut(t *testing.T) {
+	key := testKey(t)
+	p, err := pipeline.NewPipeline(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	// Encryption defaults on, but the writer does not require it.
+	w := NewArchiveWriter(&buf, p, WithRequireEncryption(false))
+
+	if err := w.AddFile("plain.txt", []byte("plain"), AddFileOptions{NoEncrypt: true}); err != nil {
+		t.Fatalf("AddFile(NoEncrypt): %v", err)
+	}
+	if err := w.AddFile("secret.txt", []byte("secret"), AddFileOptions{}); err != nil {
+		t.Fatalf("AddFile(default): %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ar, err := OpenArchive(storage.NewMemReader(buf.Bytes()), p)
+	if err != nil {
+		t.Fatalf("OpenArchive: %v", err)
+	}
+	defer ar.Close()
+
+	if _, entry, err := ar.GetFile("plain.txt"); err != nil {
+		t.Fatalf("GetFile(plain): %v", err)
+	} else if entry.IsEncrypted {
+		t.Error("plain.txt should not be encrypted")
+	}
+	if _, entry, err := ar.GetFile("secret.txt"); err != nil {
+		t.Fatalf("GetFile(secret): %v", err)
+	} else if !entry.IsEncrypted {
+		t.Error("secret.txt should be encrypted by default")
 	}
 }

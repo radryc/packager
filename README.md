@@ -5,7 +5,7 @@ A high-performance Go library that packs multiple files into a single encrypted,
 ## Features
 
 - **Indexed-Tail format** — sequential data blocks + encrypted master index + 8-byte footer. Retrieves any file in 2–3 byte-range requests.
-- **Per-file encryption** — ChaCha20-Poly1305 (AEAD) with unique random nonces. Opt out per file or keep everything encrypted.
+- **Per-file encryption, on by default** — ChaCha20-Poly1305 (AEAD) with unique random nonces. New writers encrypt every file and reject plaintext opt-outs; legacy plaintext archives remain readable.
 - **Ultra-fast compression** — zstd via [klauspost/compress](https://github.com/klauspost/compress). Multi-GB/s decompression, automatic skip for already-compressed formats.
 - **Smart detection** — PNG, JPEG, GIF, ZIP, MP4, and 20+ other formats are auto-detected by extension and magic bytes; compression is skipped automatically.
 - **Rich metadata** — each file entry stores Unix permissions, owner UID, encryption flag, and compression flag.
@@ -69,11 +69,12 @@ func main() {
     var buf bytes.Buffer
     w := packager.NewArchiveWriter(&buf, p)
 
-    // Add files with metadata
+    // Encryption is the default for new writers: zero-value AddFileOptions
+    // produces AEAD-encrypted data. AddFileOptions.Encrypt can still be set
+    // explicitly, but it is no longer needed to opt in.
     err = w.AddFile("src/main.go", []byte("package main\n"), packager.AddFileOptions{
         Permission: 0644,
         OwnerUID:   1000,
-        Encrypt:    true,
     })
     if err != nil {
         log.Fatal(err)
@@ -83,7 +84,6 @@ func main() {
     err = w.AddFile("logo.png", pngBytes, packager.AddFileOptions{
         Permission: 0444,
         OwnerUID:   1000,
-        Encrypt:    true,
     })
     if err != nil {
         log.Fatal(err)
@@ -95,6 +95,26 @@ func main() {
     }
 }
 ```
+
+### Encryption defaults
+
+`NewArchiveWriter` encrypts every file by default and requires encryption:
+`AddFileOptions{}` and `DefaultAddFileOptions()` both produce encrypted
+entries, and `AddFileOptions.NoEncrypt` is rejected with
+`ErrEncryptionRequired`. A caller that genuinely needs legacy plaintext must
+opt out on the writer and per file:
+
+```go
+w := packager.NewArchiveWriter(&buf, p,
+    packager.WithEncryptByDefault(false),
+    packager.WithRequireEncryption(false),
+)
+err := w.AddFile("legacy.txt", data, packager.AddFileOptions{NoEncrypt: true})
+```
+
+Archives already written without encryption are still read correctly: the
+reader follows each entry's `IsEncrypted` flag, and the master index is always
+encrypted and compressed.
 
 ### Reading an archive
 
