@@ -11,16 +11,26 @@ import (
 	"github.com/radryc/packager/pipeline"
 )
 
+// ErrEncryptionRequired is returned by AddFile when a caller attempts to
+// store plaintext in an archive whose writer requires encryption.
+var ErrEncryptionRequired = errors.New("encryption required: archive writer rejects plaintext files")
+
 // AddFileOptions controls per-file behaviour when adding a file to an archive.
 type AddFileOptions struct {
 	// Permission stores Unix permission bits (e.g. 0644, 0755).
 	Permission uint32
 	// OwnerUID is the numeric user ID of the file owner.
 	OwnerUID int
-	// Encrypt controls whether the file data is AEAD-encrypted.
-	// The zero value is false (no encryption). Use DefaultAddFileOptions
-	// to get encryption enabled by default.
+	// Encrypt forces AEAD encryption for this file. Encryption is already
+	// the default for new ArchiveWriters (see WithEncryptByDefault), so this
+	// field only needs to be set when the writer was created with
+	// WithEncryptByDefault(false). Use DefaultAddFileOptions for the
+	// recommended per-file defaults.
 	Encrypt bool
+	// NoEncrypt explicitly opts this file out of encryption. It is rejected
+	// with ErrEncryptionRequired unless the writer was created with
+	// WithRequireEncryption(false). It cannot be combined with Encrypt.
+	NoEncrypt bool
 	// ForceCompress overrides automatic pre-compressed detection.
 	// nil  → auto-detect (skip compression for already-compressed formats).
 	// true → always compress.  false → never compress.
@@ -47,31 +57,67 @@ func DefaultAddFileOptions() AddFileOptions {
 // appended one at a time. Call Close to finalise the archive (writes the
 // encrypted master index and 8-byte footer).
 //
+// New writers encrypt every file by default and reject explicit plaintext
+// opt-outs. Use WithEncryptByDefault(false) and WithRequireEncryption(false)
+// together to write legacy plaintext archives.
+//
 // ArchiveWriter is NOT safe for concurrent use. All AddFile/Delete/Close
 // calls must be serialised by the caller.
 type ArchiveWriter struct {
-	writer        io.Writer
-	pipeline      *pipeline.Pipeline
-	index         *PathIndex
-	currentOffset int64
-	closed        bool
+	writer            io.Writer
+	pipeline          *pipeline.Pipeline
+	index             *PathIndex
+	currentOffset     int64
+	closed            bool
+	encryptByDefault  bool
+	requireEncryption bool
+}
+
+// WriterOption configures optional ArchiveWriter behaviour.
+type WriterOption func(*ArchiveWriter)
+
+// WithEncryptByDefault controls whether files are encrypted when
+// AddFileOptions does not request it explicitly. Enabled by default, so the
+// zero value of AddFileOptions still produces encrypted archives.
+func WithEncryptByDefault(enabled bool) WriterOption {
+	return func(aw *ArchiveWriter) { aw.encryptByDefault = enabled }
+}
+
+// WithRequireEncryption controls whether plaintext files are allowed at all.
+// It is enabled by default: AddFile returns ErrEncryptionRequired whenever the
+// effective per-file setting would leave data unencrypted. Disabling it is
+// only intended for generating legacy-compatible test fixtures.
+func WithRequireEncryption(required bool) WriterOption {
+	return func(aw *ArchiveWriter) { aw.requireEncryption = required }
 }
 
 // NewArchiveWriter creates a new archive writer that writes to w.
-func NewArchiveWriter(w io.Writer, p *pipeline.Pipeline) *ArchiveWriter {
-	return &ArchiveWriter{
-		writer:        w,
-		pipeline:      p,
-		index:         NewPathIndex(),
-		currentOffset: 0,
+// Encryption is enabled and required unless overridden with WriterOptions.
+func NewArchiveWriter(w io.Writer, p *pipeline.Pipeline, opts ...WriterOption) *ArchiveWriter {
+	aw := &ArchiveWriter{
+		writer:            w,
+		pipeline:          p,
+		index:             NewPathIndex(),
+		currentOffset:     0,
+		encryptByDefault:  true,
+		requireEncryption: true,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(aw)
+		}
+	}
+	return aw
 }
 
-// AddFile compresses, optionally encrypts, and appends a file to the archive.
-// archivePath (full path including directories) is used as the index key.
-// Compression is automatically skipped for files that are already in a
+// AddFile compresses, encrypts (by default), and appends a file to the
+// archive. archivePath (full path including directories) is used as the index
+// key. Compression is automatically skipped for files that are already in a
 // compressed format (detected by extension and magic bytes) unless overridden
 // via opts.ForceCompress.
+//
+// Encryption is controlled by the writer defaults and opts; plaintext is
+// rejected unless the writer was created with WithRequireEncryption(false).
 //
 // archivePath must be a non-empty, relative, clean path. Absolute paths and
 // paths containing ".." components are rejected to prevent path traversal.
@@ -103,8 +149,22 @@ func (aw *ArchiveWriter) AddFile(archivePath string, rawData []byte, opts AddFil
 		}
 	}
 
+	// Determine whether to encrypt. Encryption is the safe default; callers
+	// must both disable it on the writer and opt out explicitly per file (or
+	// disable both writer defaults) to write plaintext.
+	if opts.Encrypt && opts.NoEncrypt {
+		return fmt.Errorf("add file %q: Encrypt and NoEncrypt are mutually exclusive", archivePath)
+	}
+	encrypt := aw.encryptByDefault || opts.Encrypt
+	if opts.NoEncrypt {
+		encrypt = false
+	}
+	if aw.requireEncryption && !encrypt {
+		return fmt.Errorf("add file %q: %w", archivePath, ErrEncryptionRequired)
+	}
+
 	// Pack (compress + encrypt based on flags)
-	packedData, err := aw.pipeline.Pack(rawData, compress, opts.Encrypt)
+	packedData, err := aw.pipeline.Pack(rawData, compress, encrypt)
 	if err != nil {
 		return fmt.Errorf("pack %q: %w", archivePath, err)
 	}
@@ -119,7 +179,7 @@ func (aw *ArchiveWriter) AddFile(archivePath string, rawData []byte, opts AddFil
 		Size:         int64(n),
 		Permission:   opts.Permission,
 		OwnerUID:     opts.OwnerUID,
-		IsEncrypted:  opts.Encrypt,
+		IsEncrypted:  encrypt,
 		IsCompressed: compress,
 		FileType:     opts.FileType,
 	})

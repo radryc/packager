@@ -5,12 +5,12 @@ A high-performance Go library that packs multiple files into a single encrypted,
 ## Features
 
 - **Indexed-Tail format** — sequential data blocks + encrypted master index + 8-byte footer. Retrieves any file in 2–3 byte-range requests.
-- **Per-file encryption** — ChaCha20-Poly1305 (AEAD) with unique random nonces. Opt out per file or keep everything encrypted.
+- **Per-file encryption, on by default** — ChaCha20-Poly1305 (AEAD) with unique random nonces. New writers encrypt every file and reject plaintext opt-outs; legacy plaintext archives remain readable.
 - **Ultra-fast compression** — zstd via [klauspost/compress](https://github.com/klauspost/compress). Multi-GB/s decompression, automatic skip for already-compressed formats.
 - **Smart detection** — PNG, JPEG, GIF, ZIP, MP4, and 20+ other formats are auto-detected by extension and magic bytes; compression is skipped automatically.
-- **Rich metadata** — each file entry stores Unix permissions, owner UID, encryption flag, and compression flag.
+- **Rich metadata** — each file entry stores Unix permissions, owner UID, file type, tombstone state, encryption flag, and compression flag.
 - **Memory-efficient index** — `PathIndex` deduplicates directory prefixes, storing each unique directory once. 100K files in 500 dirs uses ~1.2 MB instead of ~6.2 MB of path strings.
-- **WORM model** — write-once, read-many. Archives are immutable; updates create new archives.
+- **WORM model** — write-once, read-many. Archive data is never rewritten; deletes are index tombstones and updates create new archives.
 - **Pluggable storage** — `ObjectReader` interface with built-in implementations for local files, AWS S3, and Google Cloud Storage.
 - **Bit-rot protection** — AEAD authentication detects any corruption or tampering on read.
 
@@ -69,11 +69,12 @@ func main() {
     var buf bytes.Buffer
     w := packager.NewArchiveWriter(&buf, p)
 
-    // Add files with metadata
+    // Encryption is the default for new writers: zero-value AddFileOptions
+    // produces AEAD-encrypted data. AddFileOptions.Encrypt can still be set
+    // explicitly, but it is no longer needed to opt in.
     err = w.AddFile("src/main.go", []byte("package main\n"), packager.AddFileOptions{
         Permission: 0644,
         OwnerUID:   1000,
-        Encrypt:    true,
     })
     if err != nil {
         log.Fatal(err)
@@ -83,7 +84,6 @@ func main() {
     err = w.AddFile("logo.png", pngBytes, packager.AddFileOptions{
         Permission: 0444,
         OwnerUID:   1000,
-        Encrypt:    true,
     })
     if err != nil {
         log.Fatal(err)
@@ -95,6 +95,26 @@ func main() {
     }
 }
 ```
+
+### Encryption defaults
+
+`NewArchiveWriter` encrypts every file by default and requires encryption:
+`AddFileOptions{}` and `DefaultAddFileOptions()` both produce encrypted
+entries, and `AddFileOptions.NoEncrypt` is rejected with
+`ErrEncryptionRequired`. A caller that genuinely needs legacy plaintext must
+opt out on the writer and per file:
+
+```go
+w := packager.NewArchiveWriter(&buf, p,
+    packager.WithEncryptByDefault(false),
+    packager.WithRequireEncryption(false),
+)
+err := w.AddFile("legacy.txt", data, packager.AddFileOptions{NoEncrypt: true})
+```
+
+Archives already written without encryption are still read correctly: the
+reader follows each entry's `IsEncrypted` flag, and the master index is always
+encrypted and compressed.
 
 ### Reading an archive
 
@@ -363,6 +383,8 @@ Each file in the archive carries:
 | OwnerUID | `u` | int | Numeric user ID of the file owner |
 | IsEncrypted | `e` | bool | Whether AEAD encryption was applied |
 | IsCompressed | `c` | bool | Whether zstd compression was applied |
+| IsDeleted | `del` | bool | Tombstone marker for a logically deleted file (omitted when false) |
+| FileType | `t` | uint8 | `0` regular file, `1` directory, `2` symlink (omitted for regular files) |
 
 JSON keys are kept short to minimise index size. The entire index is also zstd-compressed.
 
