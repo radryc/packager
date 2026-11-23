@@ -102,19 +102,32 @@ func main() {
 `AddFileOptions{}` and `DefaultAddFileOptions()` both produce encrypted
 entries, and `AddFileOptions.NoEncrypt` is rejected with
 `ErrEncryptionRequired`. A caller that genuinely needs legacy plaintext must
-opt out on the writer and per file:
+disable both writer defaults; per-file `NoEncrypt` is not required:
 
 ```go
 w := packager.NewArchiveWriter(&buf, p,
     packager.WithEncryptByDefault(false),
     packager.WithRequireEncryption(false),
 )
-err := w.AddFile("legacy.txt", data, packager.AddFileOptions{NoEncrypt: true})
+err := w.AddFile("legacy.txt", data, packager.AddFileOptions{})
 ```
 
 Archives already written without encryption are still read correctly: the
 reader follows each entry's `IsEncrypted` flag, and the master index is always
 encrypted and compressed.
+
+Archive paths are validated: empty paths, absolute paths, and paths containing
+`..` are rejected to prevent extraction traversal. Symlinks carry their target in
+`LinkTarget` and are not followed at write time.
+
+### Envelope encryption
+
+`pipeline/envelope.go` provides envelope encryption on top of the archive
+format: `EncryptEnvelope`/`DecryptEnvelope`, a `KeyProvider` interface,
+`StaticKeyProvider`, and `KeyRingProvider` with `Rotate`/`AddKey`. The envelope
+format (`PKGRv2`) wraps a per-object data key with an AES-256-GCM KEK, records
+the key ID, and retains a legacy v1 fallback for older ciphertext. Use this when
+keys must rotate independently of archive files.
 
 ### Reading an archive
 
@@ -436,7 +449,8 @@ packager/
 ├── writer.go           # ArchiveWriter (sequential WORM builder)
 ├── reader.go           # ArchiveReader (O(1) random-access)
 ├── pipeline/
-│   └── pipeline.go     # zstd compression + ChaCha20-Poly1305 encryption
+│   ├── pipeline.go     # zstd compression + ChaCha20-Poly1305 encryption
+│   └── envelope.go     # PKGRv2 envelope encryption + key providers
 └── storage/
     ├── storage.go       # ObjectReader interface
     ├── local.go         # Local file implementation
